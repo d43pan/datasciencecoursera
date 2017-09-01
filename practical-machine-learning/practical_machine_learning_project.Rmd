@@ -1,0 +1,197 @@
+---
+title: "Practical_Machine_Learning_Project"
+output: html_document
+author: "Matt Nicole"
+date: "2017-09-01"
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(lubridate)
+library(caret)
+library(zoo)
+library(parallel)
+library(doParallel)
+
+
+```
+# Summary
+The course final for the Practical Machine Learning Courera course provided some training and test data with two assignments.  First, show the steps of creating a prediction model based on the training data.  Second, make predictions from the test data and submit those as answer to quiz questions. With a 10-k cross validation feature selection and a random forest model I was able to get 99% accuracy (and an out of sample error of about 1%).  
+
+## Steps taken and Key decisions: 
+
+* I decided to see what I could do with just the observational data.  
+* I split my data into a test set and validation set.  
+* I ran cross validation on the observational data for feature selection.
+* I ran cross validation on the observational data for model selection 
+** since this is a classification problem I looked at rpart and random forest).
+* I ran a confusion matrix on both models against the samples I held back for validation to see what the out of sample error looked like 
+
+
+### Exlporation
+I first explored the data and read the original documentation which came with the dataset.  I was able to determine that the data set was made up of four basic kinds of columns.  Observations, Calculated Statistics, Identity (or metadata), and finally the desired Outcome variable itself.  The documenation which came with the data clearly stated that the summary statistics were calculated based on windows of time and since this is my first real pass at pulling together a machine learning model, 
+
+``` {r summary and thoughts, echo= FALSE}
+
+# You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+# Your submission for the Peer Review portion should consist of a link to a Github repo with your R markdown and compiled HTML file describing your analysis. Please constrain the text of the writeup to < 2000 words and the number of figures to be less than 5. It will make it easier for the graders if you submit a repo with a gh-pages branch so the HTML page can be viewed online (and you always want to make it easy on graders :-).
+
+# In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: 
+
+#str(training)
+#names(training)
+
+#summary( training)
+#### Model Building
+
+# Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: 
+
+# exactly according to the specification (Class A), 
+# throwing the elbows to the front (Class B), 
+# lifting the dumbbell only halfway (Class C), 
+# lowering the dumbbell only halfway (Class D) 
+# and throwing the hips to the front (Class E).
+
+
+# There are four sensors 
+# Armband
+# Belt
+# Glove
+# Dumbell
+
+# Study Design
+  # Know the question
+  # Can I predict one of five classes of activities performed given a single event's numbers.
+  # Note - calculated metrics (avg, sd, min, max, etc) are over periods and not part of what I'll be predicting on.
+
+# Pick error rate
+  # I'm trying to predict a multi class case - so I'm going to focus on concordance
+
+```
+
+``` {r actual getting data}
+
+training = read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"), na.string = c("", "NA", "#DIV/0!"))
+testing   = read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"), na.string = c("", "NA", "#DIV/0!"))
+```
+
+### Data slicing
+I'm going to split my training set into two different sets in order to be able to get an out of sample error estimation later.
+```{r actual splitting data}
+
+# Split Data into Training, Testing, Validation
+# I have a lot of samples in my test sets
+
+
+set.seed(33233)
+
+inTrain <- createDataPartition(y= training$classe, p=.60, list=FALSE)
+
+proj_training <- training[inTrain,]
+proj_validation <- training[-inTrain,]
+```
+
+```{r thinking feature selection, echo=FALSE}
+
+###  In case I want to look at some k-fold action
+# folds_training <- createFolds(y = proj_training$classe, k=10, list=TRUE, returnTrain = TRUE)
+# sapply(folds, length)
+
+# Thinking about the different variables
+# should I remove near zero variance?
+# https://www.r-bloggers.com/near-zero-variance-predictors-should-we-remove-them/
+
+# Let's see if there are any no variation 
+# Looks like all of the observation variables vary
+# nzv <- nearZeroVar(observation_df, saveMetrics= TRUE)
+
+
+
+```
+
+
+# On training set - pick features using cross validation
+Since I'm focusing on using observational metrics to predict new observations - I'm going to create the data frames I need.
+
+Then - I use some notes I found (link) on how to speed up the model training by parallelizing the calls.
+
+Finally - I set up my random forest and rpart models to use 10-k cross validations and fit models to them.
+```{r feature set exploration}
+#Some columns are calculated (As described in the feature extraction and selection section of the original study) : https://web.archive.org/web/20170809020213/http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf  I'm not going to use any of these to predict my test observations.  I believe their work on creating new covariates could be useful and it'd be interesting to go back and see how much I could improve my model.
+
+# Some columns are indentity metrics (times, X, names). 
+# Some columns are observations.  I'll be using those to predict the outcome.
+observation_cols = proj_training[,grepl(pattern="^(roll|pitch|yaw|gyros|accel|magnet|total)", names(proj_training))]
+calculated_cols  = proj_training[,grepl(pattern="^(kurtosis|skewness|max|min|amplitude|var|avg|stddev)", names(proj_training))]
+identity_cols    = proj_training[,grepl(pattern="^(X|user_name|raw_(.*)|cvtd_timestamp|(.*)_window)", names(proj_training))]
+classe_cols      = proj_training[,grepl(pattern="^(classe)", names(proj_training))]
+
+
+
+proj_training <- proj_training[,c(names( observation_cols), "classe") ]
+
+
+# https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+# Run the feature extraction in parallel using advice from the course
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+## Use cross validation to find the the right parameters
+fitControl <- trainControl(method = "cv",
+                           number = 10,
+                           allowParallel = TRUE)
+
+fit_rf  <- train(classe ~ ., data=proj_training, method="rf", trControl = fitControl)
+fit_rpart <- train(classe ~ ., data=proj_training, method="rpart", trControl = fitControl)
+
+# After processing the data, we explicitly shut down the cluster by calling the stopCluster() and registerDoSEQ() functions. registerDoSEQ() function is required to force R to return to single threaded processing.
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+
+
+# Model selection
+Looking at the metrics for both models it becomes apparent that the random forest not only outperforms the rpart model (which does slightly worse that random), but it also does incredibly well in its own right.
+```{r look at models}
+fit_rf
+fit_rf$resample
+confusionMatrix.train(fit_rf)
+
+fit_rpart
+fit_rpart$resample
+confusionMatrix.train(fit_rpart)
+
+# On training set - pick prediction function using cross validation
+```{r take a look at predictions}
+test_fit_rf <- predict(fit_rf, newdata=proj_validation)
+test_fit_rpart <- predict(fit_rpart, newdata=proj_validation)
+```
+
+
+# Out of Sample Error
+My expected out of sample error for my model of choice (*rf*) is about 1%.  This gives me the confidence I need to get at least 16 out of 20 when submitting my answers to the quiz.
+```{r out of sample error}
+confusionMatrix(proj_validation$classe, test_fit_rf)
+confusionMatrix(proj_validation$classe, test_fit_rpart)
+
+
+# Look here https://stackoverflow.com/questions/12078291/r-function-prcomp-fails-with-nas-values-even-though-nas-are-allowed
+
+
+```
+
+
+#Apply to the original test set
+```{r test set}
+final_test <- predict(fit_rf, newdata=testing)
+final_test
+```
+
+
+
+
